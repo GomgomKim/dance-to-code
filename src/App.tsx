@@ -1,32 +1,37 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { applyBackspace } from './code/editing'
 import { isHelloWorld, runCode, type RunResult } from './code/runner'
 import { CodeEditor } from './components/CodeEditor'
 import { drawSkeleton } from './components/drawSkeleton'
+import { ClearOverlay, Leaderboard, MissionBrief, MissionSelect, MissionTimer, stars } from './components/MissionViews'
 import { OutputPanel } from './components/OutputPanel'
 import { ProgressRing } from './components/ProgressRing'
 import { SemaphoreFigure, SemaphoreGuide, symbolLabel } from './components/SemaphoreGuide'
+import { MISSION_CONTROLS, MISSION_COUNTDOWN_MS, MISSION_RECORDS_KEPT, MISSIONS } from './config/missions'
 import {
-  HOLD_MS, holdMsFor, POSE_BY_ID, RUN_HOLD_MS, SEMAPHORE_HOLD_MS, SEMAPHORE_TEMPLATE, TOKEN_POSES,
+  CUSTOM_POSES, HOLD_MS, holdMsFor, POSE_INFO, RUN_HOLD_MS, SEMAPHORE_HOLD_MS, SEMAPHORE_TEMPLATE, TOKEN_POSE_BY_ID, TOKEN_POSES,
 } from './config/poses'
 import { Confetti } from './fx/Confetti'
 import { setSoundEnabled, sfx, unlockAudio } from './fx/sound'
 import { usePoseLandmarker } from './hooks/usePoseLandmarker'
+import { isMissionCleared, missionAction, paletteKey, targetCode } from './mission/mission'
+import { loadRecords, saveRecord, type MissionRecord } from './mission/records'
 import { Calibrator } from './pose/calibrator'
 import { analyzePose, hipsVisible, measureCalibration, type PoseAnalysis } from './pose/classifier'
-import { buildBody, POSE_FIXTURES, semaphoreBody } from './pose/fixtures'
+import { buildBody, POSE_FIXTURES, poseSpec, semaphoreBody } from './pose/fixtures'
 import { HoldTracker } from './pose/holdTracker'
 import { readSemaphore, type SemaphoreSymbol } from './pose/semaphore'
 import type { Calibration, ClassifiedPose, Landmark, TokenPoseId } from './pose/types'
 
-type Mode = 'token' | 'semaphore'
+type Mode = 'token' | 'mission' | 'semaphore'
 type Source = 'none' | 'camera' | 'video'
 type Layout = 'landscape' | 'portrait'
+type MissionPhase = 'select' | 'countdown' | 'playing' | 'cleared'
 
 interface Hud {
   /** Raw per-frame classification (for the big label) */
   pose: ClassifiedPose
-  /** Candidate being held: TokenPoseId | 'RUN' | `SEM_${symbol}` */
+  /** Candidate being held: pose id | 'RUN' | `SEM_${symbol}` */
   candidate: string | null
   progress: number
   locked: boolean
@@ -35,7 +40,10 @@ interface Hud {
   fullBody: boolean
 }
 
+interface ClearInfo { ms: number; rank: number | null; at: number }
+
 const EMPTY_HUD: Hud = { pose: null, candidate: null, progress: 0, locked: false, semLive: null, hasBody: false, fullBody: false }
+const MODES: Mode[] = ['token', 'mission', 'semaphore']
 
 /** Keyboard simulation uses synthetic bodies, so it needs a matching synthetic calibration. */
 const SIM_CALIB: Calibration = measureCalibration(buildBody(POSE_FIXTURES.NEUTRAL))!
@@ -44,7 +52,7 @@ function simLandmarks(id: string, now: number): Landmark[] {
   if (id.startsWith('SEM_')) return semaphoreBody(id.slice(4) as SemaphoreSymbol)
   if (id === 'RUN') return buildBody({ ...POSE_FIXTURES.RUN, lift: 0.45 + 0.2 * Math.sin(now / 80) })
   if (id === 'NEUTRAL') return buildBody({ ...POSE_FIXTURES.NEUTRAL, offset: { x: 0, y: Math.sin(now / 500) * 0.004 } })
-  return buildBody(POSE_FIXTURES[id as TokenPoseId])
+  return buildBody(poseSpec(id, CUSTOM_POSES) ?? POSE_FIXTURES.NEUTRAL)
 }
 
 /** Fit the synthetic figure inside the square sim canvas. */
@@ -62,22 +70,26 @@ const writePref = (k: string, v: unknown) => {
   try { localStorage.setItem(`dtc:${k}`, JSON.stringify(v)) } catch { /* ignore */ }
 }
 
-function candidateLabel(c: string | null, pose: ClassifiedPose, mode: Mode): { emoji: string; name: string } {
-  if (c === 'RUN') return { emoji: '🚀', name: POSE_BY_ID.RUN.name }
+/** Token text as shown in legends (newlines visible). */
+const showToken = (t: string) => t.replace(/\n\s*/g, '↵ ')
+
+function candidateLabel(c: string | null, pose: ClassifiedPose): { emoji: string; name: string } {
   if (c?.startsWith('SEM_')) {
     const s = c.slice(4) as SemaphoreSymbol
     return { emoji: symbolLabel(s), name: s === 'SPACE' ? '띄어쓰기' : s === 'CANCEL' ? '지우기' : s }
   }
-  if (c && mode === 'token') {
-    const p = POSE_BY_ID[c as TokenPoseId]
-    return { emoji: p.emoji, name: p.name }
-  }
+  if (c && POSE_INFO[c]) return { emoji: POSE_INFO[c].emoji, name: POSE_INFO[c].name }
   if (pose === 'NEUTRAL') return { emoji: '🧍', name: '차렷' }
   return { emoji: '', name: '' }
 }
 
+const bestTimes = () => Object.fromEntries(MISSIONS.map((m) => [m.id, loadRecords(m.id)[0]?.ms]))
+
 export default function App() {
-  const [mode, setMode] = useState<Mode>(() => readPref('mode', 'token'))
+  const [mode, setMode] = useState<Mode>(() => {
+    const m = readPref<Mode>('mode', 'token')
+    return MODES.includes(m) ? m : 'token'
+  })
   const [layout, setLayout] = useState<Layout>(() => readPref('layout', 'landscape'))
   const [mirror, setMirror] = useState(() => readPref('mirror', true))
   const [soundOn, setSoundOn] = useState(() => readPref('sound', true))
@@ -107,6 +119,24 @@ export default function App() {
     return () => clearTimeout(t)
   }, [shakeKey])
 
+  // ---- mission mode state ----
+  const [missionId, setMissionId] = useState<string>(() => {
+    const id = readPref('mission', MISSIONS[0].id)
+    return MISSIONS.some((m) => m.id === id) ? id : MISSIONS[0].id
+  })
+  const [phase, setPhase] = useState<MissionPhase>('select')
+  const [missionCode, setMissionCode] = useState('')
+  const [countdown, setCountdown] = useState(3)
+  const [startAt, setStartAt] = useState(0)
+  const [elapsed, setElapsed] = useState(0)
+  const [records, setRecords] = useState<MissionRecord[]>(() => loadRecords(missionId))
+  const [best, setBest] = useState(bestTimes)
+  const [clear, setClear] = useState<ClearInfo | null>(null)
+  const movesRef = useRef(0)
+  const missionIndex = Math.max(0, MISSIONS.findIndex((m) => m.id === missionId))
+  const mission = MISSIONS[missionIndex]
+  const target = useMemo(() => targetCode(mission), [mission])
+
   const [hud, setHud] = useState<Hud>(EMPTY_HUD)
   const [debug, setDebug] = useState<{ a: PoseAnalysis | null; fps: number }>({ a: null, fps: 0 })
 
@@ -115,39 +145,110 @@ export default function App() {
   const fileRef = useRef<HTMLInputElement>(null)
   const { landmarkerRef, load: loadModel, state: modelState, error: modelError } = usePoseLandmarker()
 
-  const fullCode = mode === 'token' ? code : SEMAPHORE_TEMPLATE.before + letters + SEMAPHORE_TEMPLATE.after
+  const fullCode =
+    mode === 'token' ? code
+      : mode === 'mission' ? missionCode
+        : SEMAPHORE_TEMPLATE.before + letters + SEMAPHORE_TEMPLATE.after
 
-  // ---- live values for the rAF loop (avoid stale closures) ----
-  const live = useRef({ mode, source, calibrating, calibration, fullCode })
-  live.current = { mode, source, calibrating, calibration, fullCode }
+  // ---- live values for the rAF loop / callbacks (avoid stale closures) ----
+  const live = useRef({ mode, source, calibrating, calibration, fullCode, mission, phase, startAt })
+  live.current = { mode, source, calibrating, calibration, fullCode, mission, phase, startAt }
 
   const holdFor = useCallback((id: string) => {
     if (id === 'RUN') return RUN_HOLD_MS
-    return live.current.mode === 'token' ? holdMsFor(id) : SEMAPHORE_HOLD_MS
+    return live.current.mode === 'semaphore' ? SEMAPHORE_HOLD_MS : holdMsFor(id)
   }, [])
   const tracker = useRef(new HoldTracker({ holdMs: (id) => holdFor(id), gapMs: 160 }))
   const calibrator = useRef(new Calibrator(2000))
   const sim = useRef<{ id: string; until: number } | null>(null)
 
-  useEffect(() => { tracker.current.reset() }, [mode])
+  useEffect(() => { tracker.current.reset() }, [mode, phase])
   useEffect(() => { setSoundEnabled(soundOn); writePref('sound', soundOn) }, [soundOn])
   useEffect(() => writePref('mode', mode), [mode])
   useEffect(() => writePref('layout', layout), [layout])
   useEffect(() => writePref('mirror', mirror), [mirror])
+  useEffect(() => writePref('mission', missionId), [missionId])
+
+  // mission timer
+  useEffect(() => {
+    if (phase !== 'playing') return
+    const id = setInterval(() => setElapsed(performance.now() - startAt), 33)
+    return () => clearInterval(id)
+  }, [phase, startAt])
+
+  // mission countdown 3 → 2 → 1 → GO
+  useEffect(() => {
+    if (phase !== 'countdown') return
+    const steps = Math.round(MISSION_COUNTDOWN_MS / 1000)
+    setCountdown(steps)
+    sfx.confirm()
+    const timers: ReturnType<typeof setTimeout>[] = []
+    for (let i = 1; i <= steps; i++) {
+      timers.push(setTimeout(() => {
+        if (i < steps) { setCountdown(steps - i); sfx.confirm() } else {
+          setCountdown(0)
+          sfx.calibrated()
+          const now = performance.now()
+          setStartAt(now)
+          setElapsed(0)
+          setPhase('playing')
+        }
+      }, i * 1000))
+    }
+    return () => timers.forEach(clearTimeout)
+  }, [phase])
+
+  const startMission = useCallback((id: string) => {
+    unlockAudio()
+    setMissionId(id)
+    setMissionCode('')
+    setResult(null)
+    setSuccess(false)
+    setClear(null)
+    setElapsed(0)
+    movesRef.current = 0
+    setRecords(loadRecords(id))
+    setPhase('countdown')
+  }, [])
+
+  const missionList = useCallback(() => {
+    setPhase('select')
+    setClear(null)
+    setBest(bestTimes())
+  }, [])
+
+  const nextMission = missionIndex + 1 < MISSIONS.length ? MISSIONS[missionIndex + 1].id : null
 
   // ---- actions ----
   const doRun = useCallback(() => {
     sfx.run()
-    const r = runCode(live.current.fullCode)
-    const hello = isHelloWorld(r)
+    const st = live.current
+    const r = runCode(st.fullCode)
     setResult(r)
-    setSuccess(hello)
     setRunKey((k) => k + 1)
-    if (hello) {
+
+    let win = false
+    if (st.mode === 'mission') {
+      if (st.phase === 'playing' && isMissionCleared(st.mission, r)) {
+        win = true
+        const ms = performance.now() - st.startAt
+        const rec = { ms, at: Date.now(), moves: movesRef.current }
+        const saved = saveRecord(st.mission.id, rec, MISSION_RECORDS_KEPT)
+        setRecords(saved.list)
+        setClear({ ms, rank: saved.rank, at: rec.at })
+        setElapsed(ms)
+        setPhase('cleared')
+        setBest(bestTimes())
+      }
+    } else {
+      win = isHelloWorld(r)
+    }
+    setSuccess(win)
+    if (win) {
       setConfettiKey((k) => k + 1)
       setFlash((f) => ({ key: f.key + 1, big: true }))
       setTimeout(() => sfx.success(), 250)
-    } else if (!r.ok) {
+    } else if (!r.ok || st.mode === 'mission') {
       setShakeKey((k) => k + 1)
       setTimeout(() => sfx.error(), 150)
     }
@@ -158,24 +259,29 @@ export default function App() {
   const onConfirm = useCallback((id: string) => {
     sfx.confirm()
     setFlash((f) => ({ key: f.key + 1, big: false }))
-    if (id === 'RUN') { showBurst('RUN ▶'); doRun(); return }
-    if (id.startsWith('SEM_')) {
+    const st = live.current
+
+    if (st.mode === 'semaphore' || id.startsWith('SEM_')) {
+      if (id === 'RUN') { showBurst('RUN ▶'); doRun(); return }
       const s = id.slice(4) as SemaphoreSymbol
       if (s === 'CANCEL') { sfx.erase(); setLetters(applyBackspace); showBurst('⌫'); return }
-      const ch = s === 'SPACE' ? ' ' : s
-      setLetters((l) => l + ch)
+      setLetters((l) => l + (s === 'SPACE' ? ' ' : s))
       showBurst(symbolLabel(s))
       return
     }
-    const cfg = POSE_BY_ID[id as TokenPoseId]
-    if (!cfg) return
-    if (cfg.action.type === 'insert') {
-      const text = cfg.action.text
-      setCode((c) => c + text)
-      showBurst(text)
-    } else if (cfg.action.type === 'backspace') {
+
+    const action = st.mode === 'mission'
+      ? missionAction(st.mission, id)
+      : TOKEN_POSE_BY_ID[id as TokenPoseId]?.action ?? null
+    if (!action) return
+    if (st.mode === 'mission') movesRef.current++
+    const setBuf = st.mode === 'mission' ? setMissionCode : setCode
+    if (action.type === 'insert') {
+      setBuf((c) => c + action.text)
+      showBurst(showToken(action.text).trim())
+    } else if (action.type === 'backspace') {
       sfx.erase()
-      setCode(applyBackspace)
+      setBuf(applyBackspace)
       showBurst('⌫')
     } else {
       showBurst('RUN ▶')
@@ -186,7 +292,7 @@ export default function App() {
   onConfirmRef.current = onConfirm
 
   const resetCode = useCallback(() => {
-    setCode(''); setLetters(''); setResult(null); setSuccess(false); tracker.current.reset()
+    setCode(''); setLetters(''); setMissionCode(''); setResult(null); setSuccess(false); tracker.current.reset()
   }, [])
 
   // typing tick sound while the typewriter runs
@@ -266,20 +372,34 @@ export default function App() {
     setCalibrating(false)
   }
 
+  const changeMode = (m: Mode) => {
+    setMode(m)
+    if (m === 'mission') missionList()
+  }
+
   // ---- keyboard: simulation + shortcuts ----
+  const keyActions = useRef({ startMission, missionList, nextMission, changeMode })
+  keyActions.current = { startMission, missionList, nextMission, changeMode }
   useEffect(() => {
     const press = (id: string, repeat: boolean) => {
       const now = performance.now()
-      if (repeat && sim.current?.id === id) sim.current.until = Math.max(sim.current.until, now + 200)
-      else sim.current = { id, until: now + holdFor(id) + 120 }
+      if (repeat && sim.current?.id === id) {
+        sim.current.until = Math.max(sim.current.until, now + 200)
+      } else {
+        // a fresh key press is a fresh pose, even if it's the same pose as the last one
+        tracker.current.reset()
+        sim.current = { id, until: now + holdFor(id) + 120 }
+      }
     }
     const onKey = (e: KeyboardEvent) => {
       if ((e.target as HTMLElement)?.closest('input, textarea, select')) return
       const k = e.key
-      if (k === 'Escape' || (k === 'h' && live.current.mode === 'token' && !e.shiftKey)) { setShowUI((s) => !s); return }
+      const st = live.current
+      const act = keyActions.current
+      if (k === 'Escape' || (k === 'h' && st.mode !== 'semaphore' && !e.shiftKey)) { setShowUI((s) => !s); return }
       if (e.shiftKey && !e.metaKey && !e.ctrlKey) {
         const map: Record<string, () => void> = {
-          M: () => setMode((m) => (m === 'token' ? 'semaphore' : 'token')),
+          M: () => act.changeMode(MODES[(MODES.indexOf(st.mode) + 1) % MODES.length]),
           L: () => setLayout((l) => (l === 'landscape' ? 'portrait' : 'landscape')),
           F: () => setMirror((m) => !m),
           C: () => beginCalibration(),
@@ -291,9 +411,25 @@ export default function App() {
         return
       }
       if (e.metaKey || e.ctrlKey || e.altKey) return
-      if (live.current.mode === 'token') {
+
+      if (st.mode === 'token') {
         const p = TOKEN_POSES.find((x) => x.key === k)
         if (p) { e.preventDefault(); press(p.id, e.repeat) }
+      } else if (st.mode === 'mission') {
+        if (st.phase === 'select') {
+          const m = MISSIONS[Number(k) - 1]
+          if (m && !e.repeat) { e.preventDefault(); act.startMission(m.id) }
+        } else if (st.phase === 'cleared') {
+          if (e.repeat) return
+          if (k === 'r') act.startMission(st.mission.id)
+          else if (k === 'n' && act.nextMission) act.startMission(act.nextMission)
+          else if (k === 'l') act.missionList()
+        } else if (st.phase === 'playing') {
+          const i = st.mission.palette.findIndex((_, idx) => paletteKey(idx) === k)
+          if (i >= 0) { e.preventDefault(); press(st.mission.palette[i].pose, e.repeat) }
+          else if (k === 'Backspace') { e.preventDefault(); press(MISSION_CONTROLS.backspace, e.repeat) }
+          else if (k === 'Enter') { e.preventDefault(); press(MISSION_CONTROLS.run, e.repeat) }
+        }
       } else {
         if (k === '7' || k === 'Enter') { e.preventDefault(); press('RUN', e.repeat) }
         else if (k === ' ') { e.preventDefault(); press('SEM_SPACE', e.repeat) }
@@ -366,13 +502,16 @@ export default function App() {
 
       // classification
       const calib = isSim ? SIM_CALIB : st.calibration
-      const a = analyzePose(scaled, calib)
+      const a = analyzePose(scaled, calib, CUSTOM_POSES)
       let candidate: string | null = null
       let semLive: SemaphoreSymbol | null = null
       if (!(st.calibrating && !isSim)) {
+        const p = a?.pose && a.pose !== 'NEUTRAL' ? a.pose : null
         if (st.mode === 'token') {
-          candidate = a?.pose && a.pose !== 'NEUTRAL' ? a.pose : null
-        } else if (a?.pose === 'RUN') {
+          candidate = p && TOKEN_POSE_BY_ID[p as TokenPoseId] ? p : null
+        } else if (st.mode === 'mission') {
+          candidate = st.phase === 'playing' && p && missionAction(st.mission, p) ? p : null
+        } else if (p === 'RUN') {
           candidate = 'RUN'
         } else {
           semLive = readSemaphore(scaled).symbol
@@ -406,7 +545,6 @@ export default function App() {
         const w = isSim || !v?.videoWidth ? 900 : v.videoWidth
         const h = isSim || !v?.videoHeight ? 900 : v.videoHeight
         if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h }
-        cv.dataset.sim = String(isSim)
         const ctx = cv.getContext('2d')
         if (ctx) {
           const holding = !!hs.candidate && hs.progress > 0
@@ -423,16 +561,19 @@ export default function App() {
   }, [landmarkerRef])
 
   // ---- render ----
-  const label = candidateLabel(hud.candidate, hud.pose, mode)
+  const label = candidateLabel(hud.candidate, hud.pose)
   const holdTotal = hud.candidate ? holdFor(hud.candidate) : HOLD_MS
   const isSimView = source === 'none'
+  const inMission = mode === 'mission'
+  const missionToken = inMission && hud.candidate ? missionAction(mission, hud.candidate) : null
 
   const toolbar = (
     <div className="toolbar">
       <div className="brand">💃 dance<span>-to-</span>code</div>
       <div className="seg">
-        <button className={mode === 'token' ? 'on' : ''} onClick={() => setMode('token')}>토큰 모드</button>
-        <button className={mode === 'semaphore' ? 'on' : ''} onClick={() => setMode('semaphore')}>수기신호 🔥</button>
+        <button className={mode === 'token' ? 'on' : ''} onClick={() => changeMode('token')}>토큰 모드</button>
+        <button className={mode === 'mission' ? 'on' : ''} onClick={() => changeMode('mission')}>미션 🏆</button>
+        <button className={mode === 'semaphore' ? 'on' : ''} onClick={() => changeMode('semaphore')}>수기신호 🔥</button>
       </div>
       <div className="seg">
         <button className={layout === 'landscape' ? 'on' : ''} onClick={() => setLayout('landscape')}>16:9</button>
@@ -444,6 +585,7 @@ export default function App() {
       <button onClick={() => setMirror((m) => !m)}>{mirror ? '🪞 미러 ON' : '🪞 미러 OFF'}</button>
       <button onClick={() => setSoundOn((s) => !s)}>{soundOn ? '🔊' : '🔇'}</button>
       {source !== 'none' && <button onClick={beginCalibration}>🧍 캘리브레이션</button>}
+      {inMission && phase !== 'select' && <button onClick={missionList}>📋 미션 목록</button>}
       <button onClick={resetCode}>🧹 지우기</button>
       <button className="primary" onClick={() => setShowUI(false)}>🎬 녹화 모드 (Esc)</button>
     </div>
@@ -457,7 +599,15 @@ export default function App() {
       </div>
       {source === 'none' && started && <div className="sim-badge">⌨️ KEYBOARD SIM</div>}
 
-      <div className="mode-badge">{mode === 'token' ? 'TOKEN MODE' : 'SEMAPHORE · HARD'}</div>
+      <div className="mode-badge">
+        {mode === 'token' ? 'TOKEN MODE'
+          : mode === 'mission' ? `MISSION ${missionIndex + 1} · ${mission.title} ${stars(mission.difficulty)}`
+            : 'SEMAPHORE · HARD'}
+      </div>
+
+      {inMission && phase !== 'select' && (
+        <MissionTimer ms={phase === 'countdown' ? 0 : elapsed} best={best[mission.id]} running={phase === 'playing'} />
+      )}
 
       {hud.candidate && (
         <div className="ring-wrap">
@@ -470,6 +620,7 @@ export default function App() {
 
       <div className={`pose-name ${hud.locked ? 'locked' : ''} ${hud.candidate ? 'active' : ''}`}>
         {label.name || (hud.hasBody ? '·  ·  ·' : source !== 'none' ? (modelState === 'loading' ? '모델 불러오는 중…' : '사람을 찾는 중…') : '')}
+        {missionToken?.type === 'insert' && <div className="pose-token">{showToken(missionToken.text)}</div>}
       </div>
 
       {mode === 'semaphore' && (
@@ -486,6 +637,21 @@ export default function App() {
 
       {flash.key > 0 && <div key={`f${flash.key}`} className={`flash ${flash.big ? 'big' : ''}`} />}
       {burst.key > 0 && <div key={`b${burst.key}`} className="burst">{burst.text}</div>}
+
+      {inMission && phase === 'countdown' && (
+        <div className="countdown" key={countdown}>{countdown > 0 ? countdown : 'GO!'}</div>
+      )}
+      {inMission && phase === 'cleared' && clear && (
+        <ClearOverlay
+          ms={clear.ms}
+          rank={clear.rank}
+          records={records}
+          at={clear.at}
+          onRetry={() => startMission(mission.id)}
+          onNext={nextMission ? () => startMission(nextMission) : null}
+          onList={missionList}
+        />
+      )}
 
       {calibrating && (
         <div className="calib">
@@ -513,10 +679,31 @@ export default function App() {
 
   const panel = (
     <div className="panel">
-      <CodeEditor code={fullCode} filename={mode === 'token' ? 'dance.js' : 'semaphore.js'} />
+      {inMission && <MissionBrief mission={mission} index={missionIndex} />}
+      <CodeEditor
+        key={inMission ? `m-${mission.id}` : mode}
+        code={fullCode}
+        filename={mode === 'token' ? 'dance.js' : mode === 'mission' ? `mission-${missionIndex + 1}.js` : 'semaphore.js'}
+        target={inMission ? target : undefined}
+      />
       <OutputPanel result={result} success={success} runKey={runKey} />
     </div>
   )
+
+  const legendRow = (key: string, poseId: string, token: string, active: boolean) => {
+    const p = POSE_INFO[poseId]
+    return (
+      <li key={poseId} className={active ? 'active' : ''}>
+        <kbd>{key}</kbd>
+        <span className="lg-emoji">{p.emoji}</span>
+        <span className="lg-text">
+          <b>{p.name}</b>
+          <small>{p.how}</small>
+        </span>
+        <code>{token}</code>
+      </li>
+    )
+  }
 
   return (
     <div className={`app layout-${layout} ${showUI ? '' : 'clean'}`}>
@@ -530,24 +717,31 @@ export default function App() {
 
       {showUI && started && (
         <aside className="dock">
-          {mode === 'token' ? (
+          {mode === 'token' && (
             <>
               <h3>포즈 매핑</h3>
               <ul className="legend">
-                {TOKEN_POSES.map((p) => (
-                  <li key={p.id} className={hud.candidate === p.id ? 'active' : ''}>
-                    <kbd>{p.key}</kbd>
-                    <span className="lg-emoji">{p.emoji}</span>
-                    <span className="lg-text">
-                      <b>{p.name}</b>
-                      <small>{p.how}</small>
-                    </span>
-                    <code>{p.action.type === 'insert' ? p.action.text : p.action.type === 'backspace' ? '⌫' : '▶ 실행'}</code>
-                  </li>
+                {TOKEN_POSES.map((p) => legendRow(
+                  p.key, p.id,
+                  p.action.type === 'insert' ? p.action.text : p.action.type === 'backspace' ? '⌫' : '▶ 실행',
+                  hud.candidate === p.id,
                 ))}
               </ul>
             </>
-          ) : (
+          )}
+          {mode === 'mission' && (
+            <>
+              <h3>이번 미션 포즈</h3>
+              <ul className="legend legend-wide">
+                {mission.palette.map((t, i) => legendRow(paletteKey(i), t.pose, showToken(t.text), hud.candidate === t.pose))}
+                {legendRow('⌫', MISSION_CONTROLS.backspace, '⌫', hud.candidate === MISSION_CONTROLS.backspace)}
+                {legendRow('↵', MISSION_CONTROLS.run, '▶ 실행', hud.candidate === MISSION_CONTROLS.run)}
+              </ul>
+              <h3 className="dock-sub">🏁 {mission.title} 순위</h3>
+              <Leaderboard records={records} highlightAt={clear?.at} />
+            </>
+          )}
+          {mode === 'semaphore' && (
             <>
               <h3>수기신호 (화면 기준)</h3>
               <SemaphoreGuide mirror={mirror} current={hud.semLive} />
@@ -559,6 +753,10 @@ export default function App() {
           </p>
           {(mediaError || modelError) && <p className="err">{mediaError ?? `포즈 모델 로드 실패: ${modelError}`}</p>}
         </aside>
+      )}
+
+      {started && inMission && phase === 'select' && (
+        <MissionSelect missions={MISSIONS} best={best} onPick={startMission} currentId={missionId} />
       )}
 
       {!started && (

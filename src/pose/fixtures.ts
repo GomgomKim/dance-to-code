@@ -5,6 +5,7 @@
  */
 import type { Vec } from './geometry'
 import { LANDMARK_COUNT, LM, type Landmark, type TokenPoseId } from './types'
+import { ruleTheta, type CustomPoseDef } from './customPoses'
 import { SEMAPHORE_TABLE, type Dir, type SemaphoreSymbol } from './semaphore'
 
 const SW = 0.2 // shoulder width
@@ -119,4 +120,12 @@ export function semaphoreBody(symbol: SemaphoreSymbol): Landmark[] {
   let rightDir = a, leftDir = b
   if (leftSide(b) && !leftSide(a)) { rightDir = b; leftDir = a }
   return buildBody({ right: { clock: DIR_TO_CLOCK(rightDir) }, left: { clock: DIR_TO_CLOCK(leftDir) } })
+}
+
+/** Body spec for any pose: built-in fixture, or synthesized from a custom rule. */
+export function poseSpec(id: string, custom: readonly CustomPoseDef[] = []): BodySpec | null {
+  if (id in POSE_FIXTURES) return POSE_FIXTURES[id as TokenPoseId | 'NEUTRAL']
+  const def = custom.find((d) => d.id === id)
+  if (!def) return null
+  return { left: { theta: ruleTheta(def.rule.left) }, right: { theta: ruleTheta(def.rule.right) } }
 }

@@ -4,7 +4,7 @@ export function OutputPanel({ result, success, runKey }: { result: RunResult | n
   return (
     <div className={`output ${success ? 'output-success' : ''} ${result && !result.ok ? 'output-error' : ''}`} key={runKey}>
       <div className="output-label">▶ OUTPUT</div>
-      <div className="output-body">
+      <div className={`output-body ${result && result.output.length > 3 ? 'many' : ''}`}>
         {!result && <div className="output-empty">점프해서 실행 🚀</div>}
         {result?.output.map((l, i) => (
           <div key={i} className={`out-line ${success ? 'rainbow' : ''}`}>{l || ' '}</div>

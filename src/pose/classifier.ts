@@ -1,4 +1,5 @@
 import { add, dist, isVisible, jointAngle, mid, norm, rad2deg, scale, sub, type Vec } from './geometry'
+import { matchCustomPose, type CustomPoseDef } from './customPoses'
 import { LM, type Calibration, type ClassifiedPose, type Landmark } from './types'
 
 /**
@@ -114,8 +115,19 @@ export interface PoseAnalysis {
 /**
  * Pure pose classifier: landmarks (+ optional calibration) → pose id.
  * Landmarks must be in square units (x multiplied by aspect ratio), raw camera orientation.
+ * Built-in poses are checked first; `custom` rules (from config) only apply when none matched.
  */
-export function analyzePose(lm: Landmark[] | null | undefined, calib?: Calibration | null): PoseAnalysis | null {
+export function analyzePose(
+  lm: Landmark[] | null | undefined,
+  calib?: Calibration | null,
+  custom: readonly CustomPoseDef[] = [],
+): PoseAnalysis | null {
+  const base = analyzeBuiltin(lm, calib)
+  if (!base || base.pose !== null || custom.length === 0) return base
+  return { ...base, pose: matchCustomPose(base.left, base.right, custom) }
+}
+
+function analyzeBuiltin(lm: Landmark[] | null | undefined, calib?: Calibration | null): PoseAnalysis | null {
   if (!lm || lm.length < 25 || !REQUIRED.every((i) => isVisible(lm[i]))) return null
   const T = THRESHOLDS
   const frame = bodyFrame(lm)
@@ -183,8 +195,12 @@ export function analyzePose(lm: Landmark[] | null | undefined, calib?: Calibrati
   return result(null)
 }
 
-export function classifyPose(lm: Landmark[] | null | undefined, calib?: Calibration | null): ClassifiedPose {
-  return analyzePose(lm, calib)?.pose ?? null
+export function classifyPose(
+  lm: Landmark[] | null | undefined,
+  calib?: Calibration | null,
+  custom: readonly CustomPoseDef[] = [],
+): ClassifiedPose {
+  return analyzePose(lm, calib, custom)?.pose ?? null
 }
 
 /** Measure a calibration baseline from a single neutral frame. */
