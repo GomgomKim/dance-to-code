@@ -44,8 +44,11 @@ export type TokenPoseId =
   | 'HANDS_ON_HIPS'
   | 'RUN'
 
+/** Built-in pose ids, plus any custom pose id declared in src/config/poses.ts. */
+export type PoseId = TokenPoseId | (string & {})
+
 /** 'NEUTRAL' = 차렷 (both arms straight down, not jumping). */
-export type ClassifiedPose = TokenPoseId | 'NEUTRAL' | null
+export type ClassifiedPose = PoseId | 'NEUTRAL' | null
 
 /** Baseline captured during calibration (차렷 2초). */
 export interface Calibration {
